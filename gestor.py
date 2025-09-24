@@ -12,7 +12,7 @@ try:
     from argon2.low_level import hash_secret_raw, Type
     HAS_ARGON2 = True
 except Exception:
-    HAS_ARGON2 = False 
+    HAS_ARGON2 = False
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import serialization
