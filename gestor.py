@@ -437,6 +437,18 @@ def main():
     arg = args.arg
 
     if not cmd:
+        print("Gestor de Contraseñas\n")
+        print("| opcion       | Descripcion")
+        print("----------------------------------------------------------")
+        print("| init         | Para inicializar la bóveda de contraseñas")
+        print("| list         | Para listart las contraseñas")
+        print("| add          | Para Registrar nueva contraseña")
+        print("| get ID       | Para obtener una cuenta por ID")
+        print("| delete ID    | Para eliminar una cuenta por ID")
+        print("| changemaster | Para actualizar la contraseña maestra")
+        print("----------------------------------------------------------")
+        print("python gestor.py [opcion]")
+        print("----------------------------------------------------------")
         return
 
     if cmd == "init":
