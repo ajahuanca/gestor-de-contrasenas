@@ -1,8 +1,6 @@
 import os
-import sys
 import sqlite3
 import json
-import base64
 import getpass
 import argparse
 from datetime import datetime, timezone
@@ -84,6 +82,41 @@ def derive_key(password: str, salt: bytes) -> bytes:
         return derive_key_argon2(pwd, salt)
     else:
         return derive_key_scrypt(pwd, salt)
+
+
+def derive_key_from_meta(password: str, salt: bytes, kdf_name: str, kdf_params: dict) -> bytes:
+    """
+    Deriva una clave (32 bytes) usando el KDF indicado en kdf_name y los parámetros kdf_params.
+    Lanza RuntimeError si la bóveda requiere Argon2 pero argon2-cffi no está disponible.
+    """
+    pwd = password.encode("utf-8")
+
+    if kdf_name == "argon2":
+        if not HAS_ARGON2:
+            raise RuntimeError("La bóveda fue creada con Argon2 pero argon2-cffi no está disponible. Instala argon2-cffi.")
+        
+        time_cost = int(kdf_params.get("time_cost", ARGON2_PARAMS["time_cost"]))
+        memory_cost = int(kdf_params.get("memory_cost", ARGON2_PARAMS["memory_cost"]))
+        parallelism = int(kdf_params.get("parallelism", ARGON2_PARAMS["parallelism"]))
+        hash_len = int(kdf_params.get("hash_len", ARGON2_PARAMS["hash_len"]))
+        return hash_secret_raw(
+            secret=pwd,
+            salt=salt,
+            time_cost=time_cost,
+            memory_cost=memory_cost,
+            parallelism=parallelism,
+            hash_len=hash_len,
+            type=Type.ID,
+        )
+    elif kdf_name == "scrypt":
+        length = int(kdf_params.get("length", SCRYPT_PARAMS["length"]))
+        n = int(kdf_params.get("n", SCRYPT_PARAMS["n"]))
+        r = int(kdf_params.get("r", SCRYPT_PARAMS["r"]))
+        p = int(kdf_params.get("p", SCRYPT_PARAMS["p"]))
+        kdf = Scrypt(salt=salt, length=length, n=n, r=r, p=p, backend=default_backend())
+        return kdf.derive(pwd)
+    else:
+        raise ValueError(f"KDF desconocido en meta de bóveda: {kdf_name}")
 
 
 def aes_encrypt(key: bytes, plaintext: bytes) -> (bytes, bytes):
@@ -189,8 +222,6 @@ def init_vault():
     conn.commit()
     conn.close()
     print("Bóveda inicializada. No olvides tu contraseña maestra.")
-    print("-------------------------------------------------------------")
-    interactive_menu()
 
 
 def get_vault_meta():
@@ -224,9 +255,14 @@ def add_entry():
     title = input("Título (ej: correo personal): ")
     username = input("Usuario (opcional): ")
     secret = getpass.getpass("Secreto/Contraseña: ")
-    salt, kdf, kdf_params = get_vault_meta()
+    salt, kdf_name, kdf_params = get_vault_meta()
     master = getpass.getpass("Contraseña maestra: ")
-    key = derive_key(master, salt)
+    try:
+        key = derive_key_from_meta(master, salt, kdf_name, kdf_params)
+    except Exception as e:
+        print(str(e))
+        return
+    
     nonce, ct = aes_encrypt(key, secret.encode("utf-8"))
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -235,8 +271,6 @@ def add_entry():
     conn.commit()
     conn.close()
     print("Entrada añadida correctamente.")
-    print("-----------------------------------------")
-    interactive_menu()
 
 
 def list_entries():
@@ -255,8 +289,6 @@ def list_entries():
         return
     for r in rows:
         print(f"{r[0]:>3} | {r[1]:30.30} | {r[2] or '-':20.20} | {r[3]}")
-    print("--------------------------------------------------------------------------------------------")
-    interactive_menu()
 
 
 def get_entry(entry_id: int):
@@ -268,9 +300,14 @@ def get_entry(entry_id: int):
     :param entry_id:
     :return:
     """
-    salt, kdf, kdf_params = get_vault_meta()
+    salt, kdf_name, kdf_params = get_vault_meta()
     master = getpass.getpass("Contraseña maestra: ")
-    key = derive_key(master, salt)
+    try:
+        key = derive_key_from_meta(master, salt, kdf_name, kdf_params)
+    except Exception as e:
+        print(str(e))
+        return
+    
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(f"SELECT title, username, nonce, ciphertext, created_at FROM {ENTRIES_TABLE} WHERE id=?", (entry_id,))
@@ -280,15 +317,14 @@ def get_entry(entry_id: int):
         print("Entrada no encontrada.")
         return
     title, username, nonce, ciphertext, created_at = row
+
     try:
         plain = aes_decrypt(key, nonce, ciphertext).decode("utf-8")
     except Exception as e:
-        print(str(e))
         print("Error al descifrar: contraseña maestra incorrecta o datos corruptos.")
         return
+
     print(f"Título: {title}\nUsuario: {username}\nSecreto: {plain}\nCreado: {created_at}")
-    print("---------------------------------------------------------------------------------------------------")
-    interactive_menu()
 
 
 def delete_entry(entry_id: int):
@@ -303,8 +339,6 @@ def delete_entry(entry_id: int):
     conn.commit()
     conn.close()
     print(f"Entrada {entry_id} eliminada (si existía).")
-    print("-------------------------------------------")
-    interactive_menu()
 
 
 def change_master():
@@ -320,17 +354,31 @@ def change_master():
     if not vault_exists():
         print("Inicializa la bóveda primero con: init")
         return
-    salt_old, kdf, kdf_params = get_vault_meta()
+    salt_old, kdf_name, kdf_params = get_vault_meta()
     master_old = getpass.getpass("Contraseña maestra actual: ")
-    key_old = derive_key(master_old, salt_old)
-    # pedir nueva
+    try:
+        key_old = derive_key_from_meta(master_old, salt_old, kdf_name, kdf_params)
+    except Exception as e:
+        print(str(e))
+        return
+
+    # nueva contraseña
     master_new = getpass.getpass("Nueva contraseña maestra: ")
     master_new_c = getpass.getpass("Confirmar nueva contraseña: ")
     if master_new != master_new_c:
         print("Contraseñas nuevas no coinciden. Abortando.")
         return
+
     salt_new = os.urandom(16)
-    key_new = derive_key(master_new, salt_new)
+    new_kdf_name = "argon2" if HAS_ARGON2 else "scrypt"
+    new_kdf_params = ARGON2_PARAMS if HAS_ARGON2 else SCRYPT_PARAMS
+    key_new = None
+    try:
+        key_new = derive_key_from_meta(master_new, salt_new, new_kdf_name, new_kdf_params)
+    except Exception as e:
+        print("Error al derivar nueva clave:", e)
+        return
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(f"SELECT id, nonce, ciphertext FROM {ENTRIES_TABLE}")
@@ -344,16 +392,13 @@ def change_master():
             conn.close()
             return
         nonce_new, ct_new = aes_encrypt(key_new, plain)
-        cur.execute(f"UPDATE {ENTRIES_TABLE} SET nonce=?, ciphertext=? WHERE id=?",
-                    (nonce_new, ct_new, eid))
-        # actualizar meta
-        cur.execute(f"UPDATE {VAULT_TABLE} SET salt=?, kdf=?, kdf_params=? WHERE id=1",
-                    (salt_new, "argon2" if HAS_ARGON2 else "scrypt", json.dumps(ARGON2_PARAMS if HAS_ARGON2 else SCRYPT_PARAMS)))
-        conn.commit()
-        conn.close()
-        print("Contraseña maestra cambiada con éxito.")
-        print("---------------------------------------")
-        interactive_menu()
+        cur.execute(f"UPDATE {ENTRIES_TABLE} SET nonce=?, ciphertext=? WHERE id=?", (nonce_new, ct_new, eid))
+
+    cur.execute(f"UPDATE {VAULT_TABLE} SET salt=?, kdf=?, kdf_params=? WHERE id=1",
+                (salt_new, new_kdf_name, json.dumps(new_kdf_params)))
+    conn.commit()
+    conn.close()
+    print("Contraseña maestra cambiada con éxito.")
 
 
 def export_vault(path: str):
@@ -370,26 +415,6 @@ def export_vault(path: str):
     with open(path, "wb") as fdst:
         fdst.write(data)
         print(f"Exportado a {path}")
-
-
-def interactive_menu():
-    print("=== Gestor de Contraseñas ===")
-    print("Selecciona una acción:")
-    print("1. Inicializar bóveda")
-    print("2. Agregar entrada")
-    print("3. Listar entradas")
-    print("4. Obtener entrada")
-    print("5. Eliminar entrada")
-    print("6. Cambiar contraseña maestra")
-    print("7. Exportar bóveda")
-    print("0. Salir")
-
-    while True:
-        choice = input("Opción [0-7]: ").strip()
-        if choice in [str(i) for i in range(8)]:
-            return choice
-        else:
-            print("Opción inválida. Intenta de nuevo.")
 
 
 # Método principal para ejecutar el CLI
@@ -412,23 +437,7 @@ def main():
     arg = args.arg
 
     if not cmd:
-        choice = interactive_menu()
-        mapping = {
-            "1": "init",
-            "2": "add",
-            "3": "list",
-            "4": "get",
-            "5": "delete",
-            "6": "changemaster",
-            "7": "export",
-            "0": None
-        }
-        cmd = mapping[choice]
-        if cmd is None:
-            print("Saliendo...")
-            return
-        if cmd in ["get", "delete", "export"]:
-            arg = input("Ingresa el ID o path correspondiente: ").strip()
+        return
 
     if cmd == "init":
         init_vault()
